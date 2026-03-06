@@ -1,0 +1,16 @@
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Test/cache tooling
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Local editor state
+.vscode/*.log

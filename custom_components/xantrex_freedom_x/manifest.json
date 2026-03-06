@@ -1,0 +1,16 @@
+{
+  "domain": "xantrex_freedom_x",
+  "name": "Xantrex Freedom X",
+  "bluetooth": [
+    {
+      "local_name": "Freedom*"
+    }
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/example/xantrexHA",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "loggers": ["custom_components.xantrex_freedom_x"],
+  "requirements": ["bleak>=0.22.2"],
+  "version": "0.1.0"
+}

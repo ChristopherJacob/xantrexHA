@@ -1,0 +1,90 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Python: Compile integration",
+      "type": "shell",
+      "command": "${command:python.interpreterPath}",
+      "args": [
+        "-m",
+        "py_compile",
+        "custom_components/xantrex_freedom_x/*.py"
+      ],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Python: Run tests",
+      "type": "shell",
+      "command": "${command:python.interpreterPath}",
+      "args": [
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "HA: Deploy integration",
+      "type": "shell",
+      "command": "./scripts/deploy_to_ha.sh",
+      "options": {
+        "env": {
+          "HA_HOST": "${input:haHost}",
+          "HA_CONFIG_PATH": "${input:haConfigPath}",
+          "HA_SSH_USER": "${input:haUser}",
+          "HA_SSH_PORT": "${input:haPort}"
+        }
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "HA: Deploy integration + restart",
+      "type": "shell",
+      "command": "./scripts/deploy_to_ha.sh --restart",
+      "options": {
+        "env": {
+          "HA_HOST": "${input:haHost}",
+          "HA_CONFIG_PATH": "${input:haConfigPath}",
+          "HA_SSH_USER": "${input:haUser}",
+          "HA_SSH_PORT": "${input:haPort}",
+          "HA_RESTART_CMD": "${input:haRestartCmd}"
+        }
+      },
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "haHost",
+      "type": "promptString",
+      "description": "Home Assistant host/IP",
+      "default": "homeassistant.local"
+    },
+    {
+      "id": "haConfigPath",
+      "type": "promptString",
+      "description": "Remote Home Assistant config path",
+      "default": "/config"
+    },
+    {
+      "id": "haUser",
+      "type": "promptString",
+      "description": "SSH username",
+      "default": "root"
+    },
+    {
+      "id": "haPort",
+      "type": "promptString",
+      "description": "SSH port",
+      "default": "22"
+    },
+    {
+      "id": "haRestartCmd",
+      "type": "promptString",
+      "description": "Remote restart command",
+      "default": "ha core restart"
+    }
+  ]
+}
