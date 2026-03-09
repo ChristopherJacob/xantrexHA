@@ -44,6 +44,8 @@ def test_async_update_data_success() -> None:
     coordinator._address = "AA:BB:CC:DD:EE:FF"
     coordinator._last_payload = None
     coordinator._frame_history = []
+    coordinator._capture_phase = None
+    coordinator._phase_capture_history = []
     coordinator._last_char_uuid = "00002a14-0000-1000-8000-00805f9b34fb"
     coordinator._last_char_description = "Reference Time Information"
     coordinator._read_panel_payload = AsyncMock(return_value=bytes.fromhex("aa5501"))
@@ -72,6 +74,10 @@ def test_async_update_data_success() -> None:
             "top_changed_indices": [],
             "index_stats": {},
         },
+        "runtime_last_update_at": None,
+        "runtime_polls_since_update": 1,
+        "runtime_stale_after_polls": 3,
+        "runtime_is_stale": False,
     }
     coordinator._parse_payload.assert_called_once_with(
         bytes.fromhex("aa5501"), previous_payload=None
@@ -115,6 +121,10 @@ def test_async_update_data_unavailable_returns_disconnected() -> None:
             "top_changed_indices": [],
             "index_stats": {},
         },
+        "runtime_last_update_at": None,
+        "runtime_polls_since_update": 1,
+        "runtime_stale_after_polls": 3,
+        "runtime_is_stale": False,
     }
 
 
@@ -146,6 +156,10 @@ def test_async_update_data_no_payload_returns_disconnected() -> None:
             "top_changed_indices": [],
             "index_stats": {},
         },
+        "runtime_last_update_at": None,
+        "runtime_polls_since_update": 1,
+        "runtime_stale_after_polls": 3,
+        "runtime_is_stale": False,
     }
 
 
@@ -273,3 +287,77 @@ def test_build_field_diff_summary_tracks_runtime_indices() -> None:
     assert 4 in summary["top_changed_indices"]
     assert summary["index_stats"]["4"]["min"] == 40
     assert summary["index_stats"]["4"]["max"] == 55
+
+
+def test_parse_payload_alt_runtime_layout() -> None:
+    """Alternate runtime layout with leading zero words should still parse."""
+    coordinator = object.__new__(XantrexFreedomXCoordinator)
+    coordinator._last_char_uuid = "00002a03-0000-1000-8000-00805f9b34fb"
+
+    parsed = XantrexFreedomXCoordinator._parse_payload(
+        coordinator, bytes.fromhex("00000000ae0458022b0000000400d7005e050000")
+    )
+
+    assert parsed["frame_family"] == "runtime_status"
+    assert parsed["ac_source_state_raw"] == 4
+    assert parsed["runtime_flags_raw"] == 215
+
+
+def test_merge_runtime_field_fallback_reuses_last_values() -> None:
+    """Shore helper fields should survive non-runtime polling cycles."""
+    coordinator = object.__new__(XantrexFreedomXCoordinator)
+    coordinator._last_runtime_fields = {
+        "ac_source_state_raw": 3,
+        "runtime_flags_raw": 230,
+        "runtime_flags_bits": {"bit_0": False},
+        "output_power_w": 45,
+    }
+    parsed = {"frame_family": "unknown"}
+
+    XantrexFreedomXCoordinator._merge_runtime_field_fallback(coordinator, parsed)
+
+    assert parsed["ac_source_state_raw"] == 3
+    assert parsed["runtime_flags_raw"] == 230
+    assert parsed["output_power_w"] == 45
+
+
+def test_update_runtime_freshness_marks_stale_after_threshold() -> None:
+    """Runtime freshness should become stale after consecutive non-runtime polls."""
+    coordinator = object.__new__(XantrexFreedomXCoordinator)
+    coordinator._runtime_polls_since_update = 0
+    coordinator._last_runtime_update_at = "2026-03-08T21:00:00+00:00"
+
+    parsed = {"frame_family": "unknown"}
+    XantrexFreedomXCoordinator._update_runtime_freshness(coordinator, parsed)
+    XantrexFreedomXCoordinator._update_runtime_freshness(coordinator, parsed)
+    XantrexFreedomXCoordinator._update_runtime_freshness(coordinator, parsed)
+
+    assert parsed["runtime_is_stale"] is True
+    assert parsed["runtime_polls_since_update"] >= parsed["runtime_stale_after_polls"]
+
+
+def test_update_runtime_freshness_resets_on_runtime_frame() -> None:
+    """Runtime frames should reset staleness counters."""
+    coordinator = object.__new__(XantrexFreedomXCoordinator)
+    coordinator._runtime_polls_since_update = 5
+    coordinator._last_runtime_update_at = None
+    coordinator._utc_now = lambda: "2026-03-08T21:10:00+00:00"
+
+    parsed = {"frame_family": "runtime_status"}
+    XantrexFreedomXCoordinator._update_runtime_freshness(coordinator, parsed)
+
+    assert parsed["runtime_is_stale"] is False
+    assert parsed["runtime_polls_since_update"] == 0
+    assert parsed["runtime_last_update_at"] == "2026-03-08T21:10:00+00:00"
+
+
+def test_bit_flags_decodes_expected_bits() -> None:
+    """Bit flag helper should decode 16-bit status words."""
+    coordinator = object.__new__(XantrexFreedomXCoordinator)
+
+    flags = XantrexFreedomXCoordinator._bit_flags(coordinator, 0b1010)
+
+    assert flags["bit_1"] is True
+    assert flags["bit_3"] is True
+    assert flags["bit_0"] is False
+    assert flags["bit_2"] is False

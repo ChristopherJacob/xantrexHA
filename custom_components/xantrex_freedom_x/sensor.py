@@ -32,6 +32,7 @@ async def async_setup_entry(
         [
             XantrexConnectionSensor(coordinator, entry),
             XantrexRawPayloadSensor(coordinator, entry),
+            XantrexShoreCaptureSensor(coordinator, entry),
             XantrexParsedMetricSensor(
                 coordinator,
                 entry,
@@ -75,6 +76,22 @@ async def async_setup_entry(
                 native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
                 state_class=SensorStateClass.MEASUREMENT,
                 icon="mdi:current-ac",
+            ),
+            XantrexParsedMetricSensor(
+                coordinator,
+                entry,
+                key="ac_source_state_raw",
+                name="AC source state (candidate)",
+                unique_suffix="candidate_ac_source_state",
+                icon="mdi:transmission-tower",
+            ),
+            XantrexParsedMetricSensor(
+                coordinator,
+                entry,
+                key="runtime_flags_raw",
+                name="Runtime flags (candidate)",
+                unique_suffix="candidate_runtime_flags",
+                icon="mdi:flag-outline",
             ),
         ]
     )
@@ -127,6 +144,39 @@ class XantrexRawPayloadSensor(XantrexBaseSensor):
         return self.coordinator.data.parsed
 
 
+class XantrexShoreCaptureSensor(XantrexBaseSensor):
+    """Compact sensor for shore-toggle capture sessions."""
+
+    _attr_name = "Shore capture helper"
+    _attr_icon = "mdi:transmission-tower-import"
+
+    def __init__(self, coordinator: XantrexFreedomXCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_shore_capture_helper"
+
+    @property
+    def native_value(self) -> Any:
+        """Return source-state value used during shore testing."""
+        return self.coordinator.data.parsed.get("ac_source_state_raw")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return only the key shore-test attributes."""
+        parsed = self.coordinator.data.parsed
+        capture_state = self.coordinator.get_phase_capture_state()
+        return {
+            "active_phase": capture_state.get("active_phase"),
+            "ac_source_state_raw": parsed.get("ac_source_state_raw"),
+            "runtime_flags_raw": parsed.get("runtime_flags_raw"),
+            "runtime_flags_bits": parsed.get("runtime_flags_bits"),
+            "output_power_w": parsed.get("output_power_w"),
+            "runtime_last_update_at": parsed.get("runtime_last_update_at"),
+            "runtime_polls_since_update": parsed.get("runtime_polls_since_update"),
+            "runtime_is_stale": parsed.get("runtime_is_stale"),
+            "recent_phase_captures": capture_state.get("recent_phase_captures"),
+        }
+
+
 class XantrexParsedMetricSensor(XantrexBaseSensor):
     """Expose candidate parsed metrics from the latest payload."""
 
@@ -139,9 +189,9 @@ class XantrexParsedMetricSensor(XantrexBaseSensor):
         name: str,
         unique_suffix: str,
         icon: str,
-        device_class: SensorDeviceClass,
-        native_unit_of_measurement: str,
-        state_class: SensorStateClass,
+        device_class: SensorDeviceClass | None = None,
+        native_unit_of_measurement: str | None = None,
+        state_class: SensorStateClass | None = None,
     ) -> None:
         super().__init__(coordinator, entry)
         self._key = key
@@ -156,3 +206,13 @@ class XantrexParsedMetricSensor(XantrexBaseSensor):
     def native_value(self) -> Any:
         """Return parsed candidate metric value."""
         return self.coordinator.data.parsed.get(self._key)
+
+    @property
+    def available(self) -> bool:
+        """Mark runtime-derived metrics unavailable when stale."""
+        if self.coordinator.data is None:
+            return False
+        parsed = self.coordinator.data.parsed
+        if parsed.get("runtime_is_stale"):
+            return False
+        return parsed.get(self._key) is not None

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 import logging
 from typing import Any
 import asyncio
@@ -22,6 +22,8 @@ CONNECT_TIMEOUT_SECONDS = 10.0
 NOTIFY_WAIT_SECONDS = 5.0
 READ_RETRIES = 2
 FRAME_HISTORY_SIZE = 50
+PHASE_CAPTURE_HISTORY_SIZE = 120
+RUNTIME_STALE_MULTIPLIER = 3
 DEVICE_RESOLVE_RETRIES = 4
 DEVICE_RESOLVE_DELAY_SECONDS = 1.0
 VENDOR_SERVICE_UUIDS = {
@@ -79,6 +81,11 @@ class XantrexFreedomXCoordinator(DataUpdateCoordinator[XantrexSnapshot]):
         self._discovery_mode_enabled = bool(entry.options.get("discovery_mode", True))
         self._discovery_payload_history: dict[str, bytes] = {}
         self._frame_history: list[dict[str, Any]] = []
+        self._last_runtime_fields: dict[str, Any] = {}
+        self._last_runtime_update_at: str | None = None
+        self._runtime_polls_since_update = 0
+        self._capture_phase: str | None = None
+        self._phase_capture_history: list[dict[str, Any]] = []
         self._last_char_uuid: str | None = None
         self._last_char_description: str | None = None
         self._last_payload: bytes | None = None
@@ -103,6 +110,9 @@ class XantrexFreedomXCoordinator(DataUpdateCoordinator[XantrexSnapshot]):
             parsed["source_char_uuid"] = self._last_char_uuid
             parsed["source_char_description"] = self._last_char_description
             self._append_frame_history(raw_payload, parsed)
+            self._append_phase_capture(raw_payload, parsed)
+            self._merge_runtime_field_fallback(parsed)
+            self._update_runtime_freshness(parsed)
             parsed["frame_history"] = list(self._frame_history)
             parsed["field_diff_summary"] = self._build_field_diff_summary()
             return XantrexSnapshot(
@@ -119,6 +129,8 @@ class XantrexFreedomXCoordinator(DataUpdateCoordinator[XantrexSnapshot]):
                 parsed = self._parse_payload(self._last_payload) if self._last_payload else {}
                 parsed["source_char_uuid"] = self._last_char_uuid
                 parsed["source_char_description"] = self._last_char_description
+                self._merge_runtime_field_fallback(parsed)
+                self._update_runtime_freshness(parsed)
                 parsed["frame_history"] = list(self._frame_history)
                 parsed["field_diff_summary"] = self._build_field_diff_summary()
                 return XantrexSnapshot(
@@ -135,6 +147,8 @@ class XantrexFreedomXCoordinator(DataUpdateCoordinator[XantrexSnapshot]):
                 parsed = self._parse_payload(self._last_payload) if self._last_payload else {}
                 parsed["source_char_uuid"] = self._last_char_uuid
                 parsed["source_char_description"] = self._last_char_description
+                self._merge_runtime_field_fallback(parsed)
+                self._update_runtime_freshness(parsed)
                 parsed["frame_history"] = list(self._frame_history)
                 parsed["field_diff_summary"] = self._build_field_diff_summary()
                 return XantrexSnapshot(
@@ -151,6 +165,8 @@ class XantrexFreedomXCoordinator(DataUpdateCoordinator[XantrexSnapshot]):
                 parsed = self._parse_payload(self._last_payload)
                 parsed["source_char_uuid"] = self._last_char_uuid
                 parsed["source_char_description"] = self._last_char_description
+                self._merge_runtime_field_fallback(parsed)
+                self._update_runtime_freshness(parsed)
                 parsed["frame_history"] = list(self._frame_history)
                 parsed["field_diff_summary"] = self._build_field_diff_summary()
                 return XantrexSnapshot(
@@ -291,7 +307,13 @@ class XantrexFreedomXCoordinator(DataUpdateCoordinator[XantrexSnapshot]):
                             char.description,
                             payload_hex,
                         )
+                        self._update_runtime_cache_from_payload(payload_bytes, char.uuid)
                         score = self._payload_score(payload_bytes)
+                        char_uuid_lc = char.uuid.lower()
+                        if char_uuid_lc in RUNTIME_STATUS_SOURCE_UUIDS:
+                            # Prefer runtime frames when present; this keeps
+                            # helper/state entities populated during mixed polls.
+                            score += 50
                         if char.uuid.lower() in DEPRIORITIZE_VENDOR_CHAR_UUIDS:
                             # Vendor services appear to repurpose adopted UUIDs; keep them
                             # readable, but lower priority if better candidates exist.
@@ -455,16 +477,29 @@ class XantrexFreedomXCoordinator(DataUpdateCoordinator[XantrexSnapshot]):
         # Promoted aliases used by primary entities.
         parsed["ac_out_voltage_v"] = ac_out_voltage_v
         parsed["ac_frequency_hz"] = ac_frequency_hz
-        if frame_family == "runtime_status":
-            output_power_w = u16le_words[5]
+        runtime_view = self._runtime_word_view(
+            u16le_words, getattr(self, "_last_char_uuid", None)
+        )
+        if frame_family == "runtime_status" and runtime_view is not None:
+            ac_out_voltage_v = round(runtime_view["voltage_word"] / 10, 1)
+            ac_frequency_hz = round(runtime_view["frequency_word"] / 10, 1)
+            parsed["candidate_ac_out_voltage_v"] = ac_out_voltage_v
+            parsed["candidate_ac_frequency_hz"] = ac_frequency_hz
+            parsed["ac_out_voltage_v"] = ac_out_voltage_v
+            parsed["ac_frequency_hz"] = ac_frequency_hz
+            output_power_w = runtime_view["power_word"]
             parsed["candidate_output_power_w"] = output_power_w
-            parsed["candidate_output_current_tenths_a"] = u16le_words[4]
-            parsed["candidate_runtime_flags_raw"] = u16le_words[7]
+            parsed["candidate_output_current_tenths_a"] = runtime_view["current_word"]
+            parsed["candidate_runtime_flags_raw"] = runtime_view["flags_word"]
+            parsed["candidate_ac_source_state_raw"] = runtime_view["source_word"]
             parsed["output_power_w"] = output_power_w
-            if len(u16le_words) > 8:
-                parsed["candidate_runtime_counter_raw"] = u16le_words[8]
-            if len(u16le_words) > 9:
-                parsed["candidate_runtime_subcounter_raw"] = u16le_words[9]
+            parsed["ac_source_state_raw"] = runtime_view["source_word"]
+            parsed["runtime_flags_raw"] = runtime_view["flags_word"]
+            parsed["runtime_flags_bits"] = self._bit_flags(runtime_view["flags_word"])
+            if runtime_view.get("counter_word") is not None:
+                parsed["candidate_runtime_counter_raw"] = runtime_view["counter_word"]
+            if runtime_view.get("subcounter_word") is not None:
+                parsed["candidate_runtime_subcounter_raw"] = runtime_view["subcounter_word"]
             if ac_out_voltage_v > 0:
                 parsed["output_current_a_derived"] = round(output_power_w / ac_out_voltage_v, 2)
         elif frame_family == "capability_profile":
@@ -605,6 +640,46 @@ class XantrexFreedomXCoordinator(DataUpdateCoordinator[XantrexSnapshot]):
         if len(self._frame_history) > FRAME_HISTORY_SIZE:
             self._frame_history = self._frame_history[-FRAME_HISTORY_SIZE:]
 
+    def _append_phase_capture(self, payload: bytes, parsed: dict[str, Any]) -> None:
+        """Store phase-tagged snapshots for shore toggle workflows."""
+        if self._capture_phase is None:
+            return
+        if parsed.get("frame_family") != "runtime_status":
+            return
+        record = {
+            "at": self._utc_now(),
+            "phase": self._capture_phase,
+            "raw_payload_hex": payload.hex(),
+            "ac_source_state_raw": parsed.get("ac_source_state_raw"),
+            "runtime_flags_raw": parsed.get("runtime_flags_raw"),
+            "runtime_flags_bits": parsed.get("runtime_flags_bits"),
+            "output_power_w": parsed.get("output_power_w"),
+        }
+        self._phase_capture_history.append(record)
+        if len(self._phase_capture_history) > PHASE_CAPTURE_HISTORY_SIZE:
+            self._phase_capture_history = self._phase_capture_history[-PHASE_CAPTURE_HISTORY_SIZE:]
+
+    def set_capture_phase(self, phase: str | None, note: str | None = None) -> None:
+        """Set/clear active capture phase and add marker records."""
+        self._capture_phase = phase.strip().upper() if phase else None
+        marker = {
+            "at": self._utc_now(),
+            "phase": self._capture_phase,
+            "type": "marker",
+        }
+        if note:
+            marker["note"] = note
+        self._phase_capture_history.append(marker)
+        if len(self._phase_capture_history) > PHASE_CAPTURE_HISTORY_SIZE:
+            self._phase_capture_history = self._phase_capture_history[-PHASE_CAPTURE_HISTORY_SIZE:]
+
+    def get_phase_capture_state(self) -> dict[str, Any]:
+        """Return compact phase capture state for helper entities."""
+        return {
+            "active_phase": self._capture_phase,
+            "recent_phase_captures": self._phase_capture_history[-20:],
+        }
+
     def _build_field_diff_summary(self) -> dict[str, Any]:
         """Summarize index-level change activity over recent runtime frames."""
         runtime_records = [
@@ -677,12 +752,113 @@ class XantrexFreedomXCoordinator(DataUpdateCoordinator[XantrexSnapshot]):
                 and u16le_words[6] == 2000
             ):
                 return "capability_profile"
-            if (
-                source_uuid in RUNTIME_STATUS_SOURCE_UUIDS
-                and u16le_words[0] == u16le_words[2]
-                and abs(u16le_words[1] - u16le_words[3]) <= 1
-                and 550 <= u16le_words[1] <= 610
-                and 0 <= u16le_words[5] <= 4000
-            ):
+            if self._runtime_word_view(u16le_words, source_uuid) is not None:
                 return "runtime_status"
         return "unknown"
+
+    def _bit_flags(self, value: int) -> dict[str, bool]:
+        """Return bit flags for 16-bit status words."""
+        return {f"bit_{bit}": bool(value & (1 << bit)) for bit in range(16)}
+
+    def _runtime_word_view(
+        self, u16le_words: list[int], source_char_uuid: str | None
+    ) -> dict[str, int | None] | None:
+        """Return normalized runtime fields across known 2a03 layouts."""
+        source_uuid = (source_char_uuid or "").lower()
+        if source_uuid not in RUNTIME_STATUS_SOURCE_UUIDS:
+            return None
+        # Primary layout: duplicated voltage/frequency channels.
+        if (
+            len(u16le_words) >= 10
+            and u16le_words[0] == u16le_words[2]
+            and abs(u16le_words[1] - u16le_words[3]) <= 1
+            and 1100 <= u16le_words[0] <= 1300
+            and 550 <= u16le_words[1] <= 650
+        ):
+            return {
+                "voltage_word": u16le_words[0],
+                "frequency_word": u16le_words[1],
+                "current_word": u16le_words[4],
+                "power_word": u16le_words[5],
+                "source_word": u16le_words[6],
+                "flags_word": u16le_words[7],
+                "counter_word": u16le_words[8],
+                "subcounter_word": u16le_words[9],
+            }
+        # Alternate layout seen during shore transitions with leading zero words.
+        if (
+            len(u16le_words) >= 8
+            and u16le_words[0] == 0
+            and u16le_words[1] == 0
+            and 1100 <= u16le_words[2] <= 1300
+            and 550 <= u16le_words[3] <= 650
+        ):
+            return {
+                "voltage_word": u16le_words[2],
+                "frequency_word": u16le_words[3],
+                "current_word": u16le_words[4],
+                "power_word": u16le_words[5],
+                "source_word": u16le_words[6],
+                "flags_word": u16le_words[7],
+                "counter_word": u16le_words[8] if len(u16le_words) > 8 else None,
+                "subcounter_word": u16le_words[9] if len(u16le_words) > 9 else None,
+            }
+        return None
+
+    def _merge_runtime_field_fallback(self, parsed: dict[str, Any]) -> None:
+        """Keep shore helper fields populated when a cycle yields non-runtime data."""
+        runtime_keys = (
+            "ac_source_state_raw",
+            "runtime_flags_raw",
+            "runtime_flags_bits",
+            "output_power_w",
+        )
+        last_runtime_fields = getattr(self, "_last_runtime_fields", {})
+        if parsed.get("frame_family") == "runtime_status" and parsed.get("ac_source_state_raw") is not None:
+            self._last_runtime_fields = {key: parsed.get(key) for key in runtime_keys}
+            return
+        if not last_runtime_fields:
+            return
+        for key in runtime_keys:
+            if parsed.get(key) is None:
+                parsed[key] = last_runtime_fields.get(key)
+
+    def _update_runtime_cache_from_payload(self, payload: bytes, source_char_uuid: str) -> None:
+        """Update last runtime fields from any readable runtime payload."""
+        u16le_words = [
+            int.from_bytes(payload[i : i + 2], byteorder="little", signed=False)
+            for i in range(0, len(payload) - 1, 2)
+        ]
+        runtime_view = self._runtime_word_view(u16le_words, source_char_uuid)
+        if runtime_view is None:
+            return
+        self._last_runtime_fields = {
+            "ac_source_state_raw": runtime_view["source_word"],
+            "runtime_flags_raw": runtime_view["flags_word"],
+            "runtime_flags_bits": self._bit_flags(int(runtime_view["flags_word"])),
+            "output_power_w": runtime_view["power_word"],
+        }
+        self._last_runtime_update_at = self._utc_now()
+        self._runtime_polls_since_update = 0
+
+    def _update_runtime_freshness(self, parsed: dict[str, Any]) -> None:
+        """Attach runtime freshness metadata to parsed snapshot."""
+        if not hasattr(self, "_runtime_polls_since_update"):
+            self._runtime_polls_since_update = 0
+        if not hasattr(self, "_last_runtime_update_at"):
+            self._last_runtime_update_at = None
+        if parsed.get("frame_family") == "runtime_status":
+            self._runtime_polls_since_update = 0
+            if self._last_runtime_update_at is None:
+                self._last_runtime_update_at = self._utc_now()
+        else:
+            self._runtime_polls_since_update += 1
+        runtime_stale_after_polls = max(1, RUNTIME_STALE_MULTIPLIER)
+        parsed["runtime_last_update_at"] = self._last_runtime_update_at
+        parsed["runtime_polls_since_update"] = self._runtime_polls_since_update
+        parsed["runtime_stale_after_polls"] = runtime_stale_after_polls
+        parsed["runtime_is_stale"] = self._runtime_polls_since_update >= runtime_stale_after_polls
+
+    def _utc_now(self) -> str:
+        """Return current UTC timestamp in ISO format."""
+        return datetime.now(UTC).isoformat(timespec="seconds")
